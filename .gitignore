@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.venv/
+venv/
+
+# Env files
+.env
+.env.*
+
+# Logs
+*.log
+shredstream.log
+
+# Editors/OS
+.DS_Store
+.vscode/
