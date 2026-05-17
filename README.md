@@ -57,7 +57,7 @@ Edit `.env` and set:
 - gRPC target (`SHREDSTREAM_GRPC_TARGET`)
 - Program IDs and IDL map
 - ClickHouse connection
-- Claude API key (optional)
+- Claude API key (required)
 - Telegram bot token + chat id (optional)
 
 ### 4) Start ClickHouse
@@ -96,4 +96,4 @@ The pipeline builds and maintains:
 
 - Missing IDLs can be bypassed by setting `VALIDATE_IDLS_ON_STARTUP=false`.
 - If you change proto names, update `GRPC_*` in `.env`.
-- Claude scoring is optional; the pipeline runs without it.
+- Claude scoring is required; startup fails if `ANTHROPIC_API_KEY` is missing.

@@ -34,6 +34,9 @@ async def run() -> None:
     if not settings.tracked_programs:
         logger.warning("no_program_ids_configured; set PROGRAM_ID_* values in .env")
 
+    if not settings.claude_enabled:
+        raise RuntimeError("ANTHROPIC_API_KEY is required for Claude scoring")
+
     if settings.telegram_enabled:
         await send_telegram_message(
             settings.telegram_bot_token,
@@ -63,13 +66,9 @@ async def run() -> None:
     event_parsers = build_parser_registry(idl_registry, pool_registry, settings)
     logger.info("event_parsers_ready programs=%d", len(event_parsers._parsers))  # noqa: SLF001
 
-    # ---- Claude scorer (optional) --------------------------------------
-    claude_scorer: ClaudeScorer | None = None
-    if settings.claude_enabled:
-        claude_scorer = ClaudeScorer(settings)
-        logger.info("claude_scorer_enabled model=%s threshold=%.2f", settings.claude_model, settings.claude_score_threshold)
-    else:
-        logger.info("claude_scorer_disabled: set ANTHROPIC_API_KEY to enable")
+    # ---- Claude scorer (required) --------------------------------------
+    claude_scorer = ClaudeScorer(settings)
+    logger.info("claude_scorer_enabled model=%s threshold=%.2f", settings.claude_model, settings.claude_score_threshold)
 
     # ---- Mint profiler (background task) --------------------------------
     profiler = MintProfiler(settings, claude_scorer=claude_scorer)
