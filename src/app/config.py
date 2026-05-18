@@ -18,6 +18,15 @@ class Settings(BaseSettings):
     grpc_request_class: str = Field(default="SubscribeRequest", alias="GRPC_REQUEST_CLASS")
     grpc_request_json: str = Field(default="{}", alias="GRPC_REQUEST_JSON")
 
+    entry_decoder_path: str = Field(
+        default="tools/entry_decoder/target/release/entry_decoder",
+        alias="ENTRY_DECODER_PATH",
+    )
+    solana_rpc_url: str = Field(default="", alias="SOLANA_RPC_URL")
+    rpc_batch_size: int = Field(default=20, alias="RPC_BATCH_SIZE")
+    rpc_timeout_seconds: int = Field(default=10, alias="RPC_TIMEOUT_SECONDS")
+    rpc_max_concurrency: int = Field(default=4, alias="RPC_MAX_CONCURRENCY")
+
     program_id_pumpfun: str = Field(default="", alias="PROGRAM_ID_PUMPFUN")
     program_id_pumpswap: str = Field(default="", alias="PROGRAM_ID_PUMPSWAP")
     program_id_raydium: str = Field(default="", alias="PROGRAM_ID_RAYDIUM")

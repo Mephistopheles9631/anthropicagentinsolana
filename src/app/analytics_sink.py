@@ -1,12 +1,4 @@
-"""AnalyticsSink — writes structured swap/create events to dedicated ClickHouse tables.
-
-Tables created here:
-  - ``swaps``       : one row per decoded swap across all protocols
-  - ``pool_creates`` : one row per pool / token launch event
-  - ``mint_ohlcv``   : 1-minute OHLCV candles, populated by a materialized view
-  - ``mint_profiles`` : per-mint behavioural fingerprints (written by the background
-                        profiler job, schema created here for readiness)
-"""
+"""AnalyticsSink - writes structured swap/create events to ClickHouse tables."""
 from __future__ import annotations
 
 import asyncio
@@ -19,9 +11,6 @@ from .config import Settings
 from .event_parsers.base import ParsedCreate, ParsedSwap
 
 LOGGER = logging.getLogger(__name__)
-
-# ClickHouse NULL sentinel for nullable columns
-_NULL = None
 
 
 class AnalyticsSink:
@@ -36,10 +25,7 @@ class AnalyticsSink:
         )
         self._swap_buf: list[ParsedSwap] = []
         self._create_buf: list[ParsedCreate] = []
-
-    # ------------------------------------------------------------------
-    # Schema
-    # ------------------------------------------------------------------
+        self._instruction_buf: list[tuple] = []
 
     async def ensure_schema(self) -> None:
         await asyncio.to_thread(self._create_tables)
@@ -47,7 +33,6 @@ class AnalyticsSink:
     def _create_tables(self) -> None:
         db = self._db
 
-        # ---- swaps -------------------------------------------------------
         self._client.command(f"""
         CREATE TABLE IF NOT EXISTS {db}.swaps (
             ingested_at         DateTime64(3, 'UTC'),
@@ -73,7 +58,6 @@ class AnalyticsSink:
         ORDER BY (mint, ingested_at)
         """)
 
-        # ---- pool_creates ------------------------------------------------
         self._client.command(f"""
         CREATE TABLE IF NOT EXISTS {db}.pool_creates (
             ingested_at              DateTime64(3, 'UTC'),
@@ -99,7 +83,6 @@ class AnalyticsSink:
         ORDER BY (ingested_at, mint)
         """)
 
-        # ---- mint_ohlcv (1-minute candles via materialized view) ----------
         self._client.command(f"""
         CREATE TABLE IF NOT EXISTS {db}.mint_ohlcv (
             bucket          DateTime,
@@ -142,7 +125,6 @@ class AnalyticsSink:
         GROUP BY bucket, mint, quote_mint
         """)
 
-        # ---- mint_profiles (populated by background profiler) ------------
         self._client.command(f"""
         CREATE TABLE IF NOT EXISTS {db}.mint_profiles (
             mint                    String,
@@ -174,7 +156,6 @@ class AnalyticsSink:
         ORDER BY mint
         """)
 
-        # ---- creator_profiles -------------------------------------------
         self._client.command(f"""
         CREATE TABLE IF NOT EXISTS {db}.creator_profiles (
             creator             String,
@@ -190,7 +171,6 @@ class AnalyticsSink:
         ORDER BY creator
         """)
 
-        # ---- mint_scores (Claude AI assessments) ------------------------
         self._client.command(f"""
         CREATE TABLE IF NOT EXISTS {db}.mint_scores (
             mint                String,
@@ -209,11 +189,20 @@ class AnalyticsSink:
         ORDER BY (mint, scored_at)
         """)
 
-        LOGGER.info("analytics_schema_ready db=%s", db)
+        self._client.command(f"""
+        CREATE TABLE IF NOT EXISTS {db}.instruction_hits (
+            ingested_at         DateTime64(3, 'UTC'),
+            slot                Nullable(UInt64),
+            signature           Nullable(String),
+            program_name        LowCardinality(String),
+            program_id          String
+        )
+        ENGINE = MergeTree
+        PARTITION BY toYYYYMMDD(ingested_at)
+        ORDER BY (program_id, ingested_at)
+        """)
 
-    # ------------------------------------------------------------------
-    # Buffering
-    # ------------------------------------------------------------------
+        LOGGER.info("analytics_schema_ready db=%s", db)
 
     def buffer_swap(self, swap: ParsedSwap) -> None:
         self._swap_buf.append(swap)
@@ -221,23 +210,42 @@ class AnalyticsSink:
     def buffer_create(self, create: ParsedCreate) -> None:
         self._create_buf.append(create)
 
+    def buffer_instruction_hit(
+        self,
+        program_name: str,
+        program_id: str,
+        slot: int | None,
+        signature: str | None,
+        ingested_at: object,
+    ) -> None:
+        self._instruction_buf.append(
+            (ingested_at, slot, signature, program_name, program_id)
+        )
+        LOGGER.debug(
+            "instruction_hit_buffered program=%s program_id=%s slot=%s signature=%s",
+            program_name,
+            program_id,
+            slot,
+            signature,
+        )
+
     @property
     def pending(self) -> int:
-        return len(self._swap_buf) + len(self._create_buf)
-
-    # ------------------------------------------------------------------
-    # Flush
-    # ------------------------------------------------------------------
+        return len(self._swap_buf) + len(self._create_buf) + len(self._instruction_buf)
 
     async def flush(self) -> None:
         swaps, self._swap_buf = self._swap_buf, []
         creates, self._create_buf = self._create_buf, []
+        hits, self._instruction_buf = self._instruction_buf, []
         if swaps:
             await asyncio.to_thread(self._insert_swaps, swaps)
             LOGGER.info("swaps_flushed count=%d", len(swaps))
         if creates:
             await asyncio.to_thread(self._insert_creates, creates)
             LOGGER.info("creates_flushed count=%d", len(creates))
+        if hits:
+            await asyncio.to_thread(self._insert_instruction_hits, hits)
+            LOGGER.info("instruction_hits_flushed count=%d", len(hits))
 
     def _insert_swaps(self, swaps: Sequence[ParsedSwap]) -> None:
         rows = [
@@ -308,5 +316,15 @@ class AnalyticsSink:
             ],
         )
 
-    def close(self) -> None:
-        self._client.close()
+    def _insert_instruction_hits(self, hits: Sequence[tuple]) -> None:
+        self._client.insert(
+            f"{self._db}.instruction_hits",
+            list(hits),
+            column_names=[
+                "ingested_at",
+                "slot",
+                "signature",
+                "program_name",
+                "program_id",
+            ],
+        )

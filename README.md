@@ -97,3 +97,4 @@ The pipeline builds and maintains:
 - Missing IDLs can be bypassed by setting `VALIDATE_IDLS_ON_STARTUP=false`.
 - If you change proto names, update `GRPC_*` in `.env`.
 - Claude scoring is required; startup fails if `ANTHROPIC_API_KEY` is missing.
+- In shred-only mode, the decoder logs instruction data prefixes for targeted programs to help identify buy/sell patterns.

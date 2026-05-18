@@ -136,6 +136,10 @@ class MintProfiler:
         self._max_age_min = settings.profile_max_age_minutes
         self._check_interval = settings.profile_check_interval_seconds
         self._claude_scorer = claude_scorer
+        self._telegram_enabled = settings.telegram_enabled
+        self._telegram_bot_token = settings.telegram_bot_token
+        self._telegram_chat_id = settings.telegram_chat_id
+        self._notified_start = False
         self._client = clickhouse_connect.get_client(
             host=settings.clickhouse_host,
             port=settings.clickhouse_port,
@@ -170,6 +174,21 @@ class MintProfiler:
         if not rows.result_rows:
             return
 
+        if not self._notified_start:
+            LOGGER.info("profiler_started_processing mints=%d", len(rows.result_rows))
+            if self._telegram_enabled:
+                from .notifications import send_telegram_message
+
+                try:
+                    await send_telegram_message(
+                        self._telegram_bot_token,
+                        self._telegram_chat_id,
+                        "Profiler started: processing new mint profiles.",
+                    )
+                except Exception:
+                    LOGGER.exception("profiler_start_telegram_failed")
+            self._notified_start = True
+
         LOGGER.info("profiler_pending mints=%d", len(rows.result_rows))
         for row in rows.result_rows:
             mint, pool_addr, program_name, creator, symbol, name, initial_price, created_at = row
@@ -197,10 +216,17 @@ class MintProfiler:
         db = self._db
 
         def q(sql: str, params: dict | None = None) -> list:
-            return self._client.query(sql, parameters=params or {}).result_rows
+            try:
+                return self._client.query(sql, parameters=params or {}).result_rows
+            except Exception:
+                LOGGER.exception("profiler_query_failed sql=%s", sql.strip().splitlines()[0])
+                return []
 
         def ts(dt: datetime) -> str:
             return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:23]
+
+        def dt64(dt: datetime) -> datetime:
+            return _utc(dt)
 
         t = created_at
         t1m = t + timedelta(minutes=1)
@@ -213,7 +239,7 @@ class MintProfiler:
         def price_at(after: datetime) -> float | None:
             rows = q(
                 _Q_PRICE_AT.format(db=db),
-                {"mint": mint, "after": ts(after)},
+                {"mint": mint, "after": dt64(after)},
             )
             return rows[0][0] if rows and rows[0][0] else None
 
@@ -221,7 +247,7 @@ class MintProfiler:
         def window_metrics(start: datetime, end: datetime) -> dict:
             rows = q(
                 _Q_SWAP_WINDOW.format(db=db),
-                {"mint": mint, "start": ts(start), "end": ts(end)},
+                {"mint": mint, "start": dt64(start), "end": dt64(end)},
             )
             if not rows:
                 return {}
@@ -241,7 +267,7 @@ class MintProfiler:
         def wallet_conc(start: datetime, end: datetime) -> float | None:
             rows = q(
                 _Q_WALLET_CONCENTRATION.format(db=db),
-                {"mint": mint, "start": ts(start), "end": ts(end)},
+                {"mint": mint, "start": dt64(start), "end": dt64(end)},
             )
             if rows and rows[0][0] is not None:
                 return float(rows[0][0])
@@ -251,26 +277,19 @@ class MintProfiler:
         def peak_price(start: datetime, end: datetime) -> float | None:
             rows = q(
                 _Q_PEAK_PRICE.format(db=db),
-                {"mint": mint, "start": ts(start), "end": ts(end)},
+                {"mint": mint, "start": dt64(start), "end": dt64(end)},
             )
             return float(rows[0][0]) if rows and rows[0][0] else None
 
-        # Run all queries concurrently
-        (
-            p5m, p15m, p1h,
-            m5m, m15m, m1h,
-            conc5m,
-            peak,
-        ) = await asyncio.gather(
-            asyncio.to_thread(price_at, t5m),
-            asyncio.to_thread(price_at, t15m),
-            asyncio.to_thread(price_at, t1h),
-            asyncio.to_thread(window_metrics, t, t5m),
-            asyncio.to_thread(window_metrics, t, t15m),
-            asyncio.to_thread(window_metrics, t, t1h),
-            asyncio.to_thread(wallet_conc, t, t5m),
-            asyncio.to_thread(peak_price, t, t4h),
-        )
+        # Run queries sequentially to avoid concurrent-use errors in clickhouse_connect.
+        p5m = await asyncio.to_thread(price_at, t5m)
+        p15m = await asyncio.to_thread(price_at, t15m)
+        p1h = await asyncio.to_thread(price_at, t1h)
+        m5m = await asyncio.to_thread(window_metrics, t, t5m)
+        m15m = await asyncio.to_thread(window_metrics, t, t15m)
+        m1h = await asyncio.to_thread(window_metrics, t, t1h)
+        conc5m = await asyncio.to_thread(wallet_conc, t, t5m)
+        peak = await asyncio.to_thread(peak_price, t, t4h)
 
         # ---- derived metrics -----------------------------------------
         effective_initial = initial_price or m5m.get("first_price") or 0.0
@@ -340,6 +359,7 @@ class MintProfiler:
             "mint_profiled mint=%s program=%s peak_mult=%.2f trade5m=%d",
             mint, program_name, peak_mult or 0, m5m.get("trade_count", 0),
         )
+
 
         # ---- update creator_profiles ---------------------------------
         if creator:

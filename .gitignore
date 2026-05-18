@@ -16,6 +16,9 @@ venv/
 *.log
 shredstream.log
 
+# Rust
+tools/entry_decoder/target/
+
 # Editors/OS
 .DS_Store
 .vscode/

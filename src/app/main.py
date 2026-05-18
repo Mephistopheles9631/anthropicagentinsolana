@@ -17,6 +17,9 @@ from .profiler import MintProfiler
 from .program_filter import extract_signature, extract_slot, find_tracked_program
 from .shredstream_client import ShredstreamClient, payload_to_json
 from .notifications import send_telegram_message
+from .entry_decoder import EntryDecoder
+from .instruction_parsers.pumpfun_ix import PumpfunInstructionParser
+from .instruction_parsers.pumpswap_ix import PumpswapInstructionParser
 
 
 def configure_logging() -> None:
@@ -36,6 +39,7 @@ async def run() -> None:
 
     if not settings.claude_enabled:
         raise RuntimeError("ANTHROPIC_API_KEY is required for Claude scoring")
+
 
     if settings.telegram_enabled:
         await send_telegram_message(
@@ -79,72 +83,222 @@ async def run() -> None:
     await sink.ensure_schema()
 
     client = ShredstreamClient(settings)
+    entry_decoder = EntryDecoder(settings)
+
+    pumpfun_id = settings.program_id_pumpfun.strip()
+    pumpfun_ix_parser: PumpfunInstructionParser | None = None
+    if pumpfun_id:
+        pf_idl = idl_registry._by_program_id.get(pumpfun_id)  # noqa: SLF001
+        if pf_idl is not None:
+            pumpfun_ix_parser = PumpfunInstructionParser(pumpfun_id, pf_idl)
+            logger.info("instruction_parser_ready program=pumpfun")
+        else:
+            logger.warning("instruction_parser_missing program=pumpfun id=%s", pumpfun_id)
+
+    pumpswap_id = settings.program_id_pumpswap.strip()
+    pumpswap_ix_parser: PumpswapInstructionParser | None = None
+    if pumpswap_id:
+        pumpswap_ix_parser = PumpswapInstructionParser(pumpswap_id, pool_registry)
+        logger.info("instruction_parser_ready program=pumpswap")
 
     batch: list[FilteredEvent] = []
     batch_size = max(1, settings.batch_size)
     flush_interval = max(0.1, settings.flush_interval_seconds)
     next_flush = loop.time() + flush_interval
 
-    try:
-        async for payload in client.stream():
-            slot = extract_slot(payload)
-            signature = extract_signature(payload)
-            logger.debug("shredstream_entry_received slot=%s signature=%s", slot, signature)
+    async def process_payload(payload: dict, instruction_only: bool = False) -> None:
+        nonlocal next_flush
+        slot = extract_slot(payload)
+        signature = extract_signature(payload)
+        logger.debug("shredstream_entry_received slot=%s signature=%s", slot, signature)
 
-            matched = find_tracked_program(payload, settings.tracked_programs)
-            if matched is None:
-                now = loop.time()
-                if batch and now >= next_flush:
-                    await sink.insert_batch(batch)
-                    await analytics_sink.flush()
-                    logger.info("batch_flushed size=%d", len(batch))
-                    batch.clear()
-                    next_flush = now + flush_interval
-                continue
-
-            program_name, program_id = matched
-            ingested_at = FilteredEvent.now_utc()
-
-            decoded = idl_registry.decode(program_id, payload)
-
-            # ---- structured event parsing --------------------------------
-            signer = extract_signer(payload)
-            for log_data in extract_program_data_bytes(payload):
-                result = event_parsers.parse(
-                    program_id, log_data, slot, signature, signer, ingested_at
-                )
-                if result is None:
-                    continue
-                from .event_parsers.base import ParsedCreate, ParsedSwap
-                if isinstance(result, ParsedSwap) and result.mint:
-                    analytics_sink.buffer_swap(result)
-                elif isinstance(result, ParsedCreate):
-                    analytics_sink.buffer_create(result)
-                    if result.pool_address and result.mint and result.quote_mint:
-                        pool_registry.update(result.pool_address, result.mint, result.quote_mint)
-
-            batch.append(
-                FilteredEvent(
-                    program_name=program_name,
-                    program_id=program_id,
-                    idl_label=decoded.idl_label,
-                    idl_instruction=decoded.instruction_name,
-                    idl_event=decoded.event_name,
-                    slot=slot,
-                    signature=signature,
-                    source="shredstream",
-                    raw_json=payload_to_json(payload),
-                    ingested_at=ingested_at,
-                )
-            )
-
+        matched = find_tracked_program(payload, settings.tracked_programs)
+        if matched is None:
             now = loop.time()
-            if len(batch) >= batch_size or now >= next_flush:
+            if batch and now >= next_flush:
                 await sink.insert_batch(batch)
                 await analytics_sink.flush()
-                logger.info("batch_flushed size=%d analytics_pending=%d", len(batch), analytics_sink.pending)
+                logger.info("batch_flushed size=%d", len(batch))
                 batch.clear()
+                return
+            return
+
+        program_name, program_id = matched
+        ingested_at = FilteredEvent.now_utc()
+
+        decoded = idl_registry.decode(program_id, payload)
+
+        # ---- structured event parsing --------------------------------
+        signer = extract_signer(payload)
+        log_chunks = extract_program_data_bytes(payload)
+        if instruction_only and not log_chunks:
+            analytics_sink.buffer_instruction_hit(
+                program_name, program_id, slot, signature, ingested_at
+            )
+            logger.info(
+                "instruction_hit program=%s program_id=%s slot=%s signature=%s",
+                program_name,
+                program_id,
+                slot,
+                signature,
+            )
+            now = loop.time()
+            if now >= next_flush:
+                await analytics_sink.flush()
+                logger.info("analytics_flushed analytics_pending=%d", analytics_sink.pending)
                 next_flush = now + flush_interval
+            return
+
+        for log_data in log_chunks:
+            result = event_parsers.parse(
+                program_id, log_data, slot, signature, signer, ingested_at
+            )
+            if result is None:
+                continue
+            from .event_parsers.base import ParsedCreate, ParsedSwap
+            if isinstance(result, ParsedSwap) and result.mint:
+                logger.info(
+                    "swap_detected program=%s mint=%s pool=%s slot=%s signature=%s",
+                    program_name,
+                    result.mint,
+                    result.pool_address,
+                    slot,
+                    signature,
+                )
+                analytics_sink.buffer_swap(result)
+            elif isinstance(result, ParsedCreate):
+                logger.info(
+                    "mint_detected program=%s mint=%s pool=%s slot=%s signature=%s",
+                    program_name,
+                    result.mint,
+                    result.pool_address,
+                    slot,
+                    signature,
+                )
+                analytics_sink.buffer_create(result)
+                if result.pool_address and result.mint and result.quote_mint:
+                    pool_registry.update(result.pool_address, result.mint, result.quote_mint)
+
+        batch.append(
+            FilteredEvent(
+                program_name=program_name,
+                program_id=program_id,
+                idl_label=decoded.idl_label,
+                idl_instruction=decoded.instruction_name,
+                idl_event=decoded.event_name,
+                slot=slot,
+                signature=signature,
+                source="shredstream",
+                raw_json=payload_to_json(payload),
+                ingested_at=ingested_at,
+            )
+        )
+
+        now = loop.time()
+        if len(batch) >= batch_size or now >= next_flush:
+            await sink.insert_batch(batch)
+            await analytics_sink.flush()
+            logger.info("batch_flushed size=%d analytics_pending=%d", len(batch), analytics_sink.pending)
+            batch.clear()
+            return
+
+    try:
+        async for payload in client.stream():
+            if isinstance(payload, dict) and "entries" in payload and "transaction" not in payload:
+                entries_b64 = payload.get("entries")
+                if isinstance(entries_b64, str) and entries_b64:
+                    decoded_txs = await entry_decoder.decode_transactions(entries_b64)
+                    if decoded_txs:
+                        logger.info("entry_transactions_decoded count=%d", len(decoded_txs))
+                        for item in decoded_txs:
+                            signature = item.get("signature")
+                            instructions = item.get("instructions") or []
+                            for inst in instructions:
+                                if not isinstance(inst, dict):
+                                    continue
+                                program_id = inst.get("program_id")
+                                data_hex = inst.get("data_hex") or ""
+                                accounts = inst.get("accounts") or []
+                                if not isinstance(program_id, str):
+                                    continue
+                                if program_id in settings.tracked_program_lookup:
+                                    program_name = settings.tracked_program_lookup[program_id]
+                                    prefix = data_hex[:16]
+                                    logger.info(
+                                        "swap_candidate program=%s program_id=%s slot=%s signature=%s data_prefix=%s",
+                                        program_name,
+                                        program_id,
+                                        payload.get("slot"),
+                                        signature,
+                                        prefix,
+                                    )
+                                    if program_id == pumpfun_id and pumpfun_ix_parser is not None:
+                                        from .event_parsers.base import ParsedCreate, ParsedSwap
+
+                                        if not isinstance(accounts, list):
+                                            accounts = []
+                                        ingested_at = FilteredEvent.now_utc()
+                                        parsed = pumpfun_ix_parser.try_parse(
+                                            data_hex,
+                                            accounts,
+                                            payload.get("slot"),
+                                            signature,
+                                            ingested_at,
+                                        )
+                                        if isinstance(parsed, ParsedSwap):
+                                            logger.info(
+                                                "swap_detected program=%s mint=%s pool=%s slot=%s signature=%s source=instruction",
+                                                program_name,
+                                                parsed.mint,
+                                                parsed.pool_address,
+                                                payload.get("slot"),
+                                                signature,
+                                            )
+                                            analytics_sink.buffer_swap(parsed)
+                                        elif isinstance(parsed, ParsedCreate):
+                                            logger.info(
+                                                "mint_detected program=%s mint=%s pool=%s slot=%s signature=%s source=instruction",
+                                                program_name,
+                                                parsed.mint,
+                                                parsed.pool_address,
+                                                payload.get("slot"),
+                                                signature,
+                                            )
+                                            analytics_sink.buffer_create(parsed)
+                                            if parsed.pool_address and parsed.mint and parsed.quote_mint:
+                                                pool_registry.update(parsed.pool_address, parsed.mint, parsed.quote_mint)
+                                    if program_id == pumpswap_id and pumpswap_ix_parser is not None:
+                                        from .event_parsers.base import ParsedSwap
+
+                                        if not isinstance(accounts, list):
+                                            accounts = []
+                                        ingested_at = FilteredEvent.now_utc()
+                                        parsed = pumpswap_ix_parser.try_parse(
+                                            data_hex,
+                                            accounts,
+                                            payload.get("slot"),
+                                            signature,
+                                            ingested_at,
+                                        )
+                                        if isinstance(parsed, ParsedSwap):
+                                            logger.info(
+                                                "swap_detected program=%s mint=%s pool=%s slot=%s signature=%s source=instruction",
+                                                program_name,
+                                                parsed.mint,
+                                                parsed.pool_address,
+                                                payload.get("slot"),
+                                                signature,
+                                            )
+                                            analytics_sink.buffer_swap(parsed)
+                                tx_payload = {
+                                    "slot": payload.get("slot"),
+                                    "signature": signature,
+                                    "program_id": program_id,
+                                }
+                                await process_payload(tx_payload, instruction_only=True)
+                continue
+
+            await process_payload(payload)
     finally:
         profiler_task.cancel()
         try:

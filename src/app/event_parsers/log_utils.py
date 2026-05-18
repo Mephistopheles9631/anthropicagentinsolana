@@ -68,9 +68,10 @@ def extract_signer(payload: dict) -> str | None:
     try:
         raw_bytes = _b64.b64decode(raw_b64)
     except Exception:
-        return None
+        # If already base58, return as-is
+        return raw_b64
     if len(raw_bytes) != 32:
-        return None
+        return raw_b64
     # local import to avoid circular — borsh module has the b58 encoder
     from .borsh import _b58encode  # type: ignore[attr-defined]
     return _b58encode(raw_bytes)
