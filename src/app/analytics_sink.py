@@ -26,6 +26,7 @@ class AnalyticsSink:
         self._swap_buf: list[ParsedSwap] = []
         self._create_buf: list[ParsedCreate] = []
         self._instruction_buf: list[tuple] = []
+        self._parse_failure_buf: list[tuple] = []
 
     async def ensure_schema(self) -> None:
         await asyncio.to_thread(self._create_tables)
@@ -202,6 +203,21 @@ class AnalyticsSink:
         ORDER BY (program_id, ingested_at)
         """)
 
+        self._client.command(f"""
+        CREATE TABLE IF NOT EXISTS {db}.parse_failures (
+            ingested_at         DateTime64(3, 'UTC'),
+            slot                Nullable(UInt64),
+            signature           Nullable(String),
+            program_name        LowCardinality(String),
+            program_id          String,
+            parser_errors       Array(String),
+            log_data_hex        String
+        )
+        ENGINE = MergeTree
+        PARTITION BY toYYYYMMDD(ingested_at)
+        ORDER BY (program_id, ingested_at)
+        """)
+
         LOGGER.info("analytics_schema_ready db=%s", db)
 
     def buffer_swap(self, swap: ParsedSwap) -> None:
@@ -231,12 +247,48 @@ class AnalyticsSink:
 
     @property
     def pending(self) -> int:
-        return len(self._swap_buf) + len(self._create_buf) + len(self._instruction_buf)
+        return (
+            len(self._swap_buf)
+            + len(self._create_buf)
+            + len(self._instruction_buf)
+            + len(self._parse_failure_buf)
+        )
+
+    def buffer_parse_failure(
+        self,
+        ingested_at: object,
+        slot: int | None,
+        signature: str | None,
+        program_name: str,
+        program_id: str,
+        parser_errors: list[str],
+        log_data_hex: str,
+    ) -> None:
+        self._parse_failure_buf.append(
+            (
+                ingested_at,
+                slot,
+                signature,
+                program_name,
+                program_id,
+                parser_errors,
+                log_data_hex,
+            )
+        )
+        LOGGER.debug(
+            "parse_failure_buffered program=%s program_id=%s slot=%s signature=%s error_count=%d",
+            program_name,
+            program_id,
+            slot,
+            signature,
+            len(parser_errors),
+        )
 
     async def flush(self) -> None:
         swaps, self._swap_buf = self._swap_buf, []
         creates, self._create_buf = self._create_buf, []
         hits, self._instruction_buf = self._instruction_buf, []
+        parse_failures, self._parse_failure_buf = self._parse_failure_buf, []
         if swaps:
             await asyncio.to_thread(self._insert_swaps, swaps)
             LOGGER.info("swaps_flushed count=%d", len(swaps))
@@ -246,6 +298,9 @@ class AnalyticsSink:
         if hits:
             await asyncio.to_thread(self._insert_instruction_hits, hits)
             LOGGER.info("instruction_hits_flushed count=%d", len(hits))
+        if parse_failures:
+            await asyncio.to_thread(self._insert_parse_failures, parse_failures)
+            LOGGER.info("parse_failures_flushed count=%d", len(parse_failures))
 
     def _insert_swaps(self, swaps: Sequence[ParsedSwap]) -> None:
         rows = [
@@ -328,3 +383,21 @@ class AnalyticsSink:
                 "program_id",
             ],
         )
+
+    def _insert_parse_failures(self, parse_failures: Sequence[tuple]) -> None:
+        self._client.insert(
+            f"{self._db}.parse_failures",
+            list(parse_failures),
+            column_names=[
+                "ingested_at",
+                "slot",
+                "signature",
+                "program_name",
+                "program_id",
+                "parser_errors",
+                "log_data_hex",
+            ],
+        )
+
+    def close(self) -> None:
+        self._client.close()

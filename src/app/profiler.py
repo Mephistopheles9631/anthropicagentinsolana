@@ -88,7 +88,7 @@ SELECT
     arraySum(arraySlice(
         arrayReverseSort(groupArray(wallet_vol)),
         1, 5
-    )) / greatest(total_vol, 1) AS top5_share
+    )) / greatest(sum(wallet_vol), 1) AS top5_share
 FROM (
     SELECT
         signer,
@@ -99,12 +99,6 @@ FROM (
       AND ingested_at BETWEEN {{start:DateTime64(3)}} AND {{end:DateTime64(3)}}
     GROUP BY signer
 ) AS t
-CROSS JOIN (
-    SELECT sum(if(direction = 'buy', amount_in, amount_out)) AS total_vol
-    FROM {db}.swaps
-    WHERE mint = {{mint:String}}
-      AND ingested_at BETWEEN {{start:DateTime64(3)}} AND {{end:DateTime64(3)}}
-) AS tv
 """
 
 _Q_UPDATE_CREATOR = """
@@ -122,6 +116,12 @@ FROM {db}.mint_profiles
 WHERE creator = {{creator:String}}
   AND peak_multiplier IS NOT NULL
 GROUP BY creator
+"""
+
+_Q_PROFILE_EXISTS = """
+SELECT count()
+FROM {db}.mint_profiles FINAL
+WHERE mint = {{mint:String}}
 """
 
 
@@ -212,8 +212,12 @@ class MintProfiler:
         initial_price: float | None,
         created_at: datetime,
     ) -> None:
-        now = datetime.now(timezone.utc)
         db = self._db
+
+        already_profiled = await asyncio.to_thread(self._has_existing_profile, mint)
+        if already_profiled:
+            LOGGER.info("mint_profile_skip_existing mint=%s", mint)
+            return
 
         def q(sql: str, params: dict | None = None) -> list:
             try:
@@ -314,46 +318,63 @@ class MintProfiler:
 
         # ---- write mint_profiles -------------------------------------
         now_str = ts(datetime.now(timezone.utc))
-        self._client.insert(
-            f"{db}.mint_profiles",
-            [[
-                mint,
-                ts(created_at),
-                program_name,
-                creator,
-                symbol,
-                name,
-                initial_price if initial_price else effective_initial or None,
-                p5m,
-                p15m,
-                p1h,
-                peak,
-                peak_mult,
-                m5m.get("volume_quote"),
-                m15m.get("volume_quote"),
-                m1h.get("volume_quote"),
-                m5m.get("trade_count"),
-                buy_sell_5m,
-                m5m.get("unique_buyers"),
-                m15m.get("unique_buyers"),
-                conc5m,
-                creator_past if creator_past else None,
-                creator_avg_mult,
-                None,   # outcome_label — labelled later
-                now_str,
-            ]],
-            column_names=[
-                "mint", "created_at", "program_name", "creator",
-                "symbol", "name",
-                "initial_price", "price_5m", "price_15m", "price_1h",
-                "price_peak", "peak_multiplier",
-                "volume_quote_5m", "volume_quote_15m", "volume_quote_1h",
-                "trade_count_5m", "buy_sell_ratio_5m",
-                "unique_buyers_5m", "unique_buyers_15m",
-                "wallet_concentration_5m",
-                "creator_past_tokens", "creator_avg_peak_mult",
-                "outcome_label", "updated_at",
-            ],
+        insert_sql = f"""
+        INSERT INTO {db}.mint_profiles (
+            mint, created_at, program_name, creator,
+            symbol, name,
+            initial_price, price_5m, price_15m, price_1h,
+            price_peak, peak_multiplier,
+            volume_quote_5m, volume_quote_15m, volume_quote_1h,
+            trade_count_5m, buy_sell_ratio_5m,
+            unique_buyers_5m, unique_buyers_15m,
+            wallet_concentration_5m,
+            creator_past_tokens, creator_avg_peak_mult,
+            outcome_label, updated_at
+        )
+        SELECT
+            {{mint:String}}, {{created_at:DateTime64(3)}}, {{program_name:String}}, {{creator:String}},
+            {{symbol:Nullable(String)}}, {{name:Nullable(String)}},
+            {{initial_price:Nullable(Float64)}}, {{price_5m:Nullable(Float64)}}, {{price_15m:Nullable(Float64)}}, {{price_1h:Nullable(Float64)}},
+            {{price_peak:Nullable(Float64)}}, {{peak_multiplier:Nullable(Float64)}},
+            {{volume_quote_5m:Nullable(Float64)}}, {{volume_quote_15m:Nullable(Float64)}}, {{volume_quote_1h:Nullable(Float64)}},
+            {{trade_count_5m:Nullable(UInt32)}}, {{buy_sell_ratio_5m:Nullable(Float32)}},
+            {{unique_buyers_5m:Nullable(UInt32)}}, {{unique_buyers_15m:Nullable(UInt32)}},
+            {{wallet_concentration_5m:Nullable(Float32)}},
+            {{creator_past_tokens:Nullable(UInt16)}}, {{creator_avg_peak_mult:Nullable(Float32)}},
+            NULL, {{updated_at:DateTime64(3)}}
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM {db}.mint_profiles FINAL
+            WHERE mint = {{mint:String}}
+        )
+        """
+        self._client.command(
+            insert_sql,
+            parameters={
+                "mint": mint,
+                "created_at": ts(created_at),
+                "program_name": program_name,
+                "creator": creator,
+                "symbol": symbol,
+                "name": name,
+                "initial_price": initial_price if initial_price else effective_initial or None,
+                "price_5m": p5m,
+                "price_15m": p15m,
+                "price_1h": p1h,
+                "price_peak": peak,
+                "peak_multiplier": peak_mult,
+                "volume_quote_5m": m5m.get("volume_quote"),
+                "volume_quote_15m": m15m.get("volume_quote"),
+                "volume_quote_1h": m1h.get("volume_quote"),
+                "trade_count_5m": m5m.get("trade_count"),
+                "buy_sell_ratio_5m": buy_sell_5m,
+                "unique_buyers_5m": m5m.get("unique_buyers"),
+                "unique_buyers_15m": m15m.get("unique_buyers"),
+                "wallet_concentration_5m": conc5m,
+                "creator_past_tokens": creator_past if creator_past else None,
+                "creator_avg_peak_mult": creator_avg_mult,
+                "updated_at": now_str,
+            },
         )
         LOGGER.info(
             "mint_profiled mint=%s program=%s peak_mult=%.2f trade5m=%d",
@@ -396,6 +417,17 @@ class MintProfiler:
             asyncio.create_task(
                 self._claude_scorer.score_and_store(mint, profile_dict, db, self._client)  # type: ignore[attr-defined]
             )
+
+    def _has_existing_profile(self, mint: str) -> bool:
+        try:
+            rows = self._client.query(
+                _Q_PROFILE_EXISTS.format(db=self._db),
+                parameters={"mint": mint},
+            ).result_rows
+            return bool(rows and int(rows[0][0] or 0) > 0)
+        except Exception:
+            LOGGER.exception("profile_exists_query_failed mint=%s", mint)
+            return False
 
     def close(self) -> None:
         self._client.close()

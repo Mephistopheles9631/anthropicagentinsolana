@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+LOGGER = logging.getLogger(__name__)
+_B58_CHARS = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
 
 class Settings(BaseSettings):
@@ -22,10 +27,7 @@ class Settings(BaseSettings):
         default="tools/entry_decoder/target/release/entry_decoder",
         alias="ENTRY_DECODER_PATH",
     )
-    solana_rpc_url: str = Field(default="", alias="SOLANA_RPC_URL")
-    rpc_batch_size: int = Field(default=20, alias="RPC_BATCH_SIZE")
-    rpc_timeout_seconds: int = Field(default=10, alias="RPC_TIMEOUT_SECONDS")
-    rpc_max_concurrency: int = Field(default=4, alias="RPC_MAX_CONCURRENCY")
+    entry_decoder_timeout_seconds: int = Field(default=8, alias="ENTRY_DECODER_TIMEOUT_SECONDS")
 
     program_id_pumpfun: str = Field(default="", alias="PROGRAM_ID_PUMPFUN")
     program_id_pumpswap: str = Field(default="", alias="PROGRAM_ID_PUMPSWAP")
@@ -60,10 +62,26 @@ class Settings(BaseSettings):
     claude_model: str = Field(default="claude-haiku-4-5", alias="CLAUDE_MODEL")
     claude_score_threshold: float = Field(default=0.70, alias="CLAUDE_SCORE_THRESHOLD")
     claude_max_examples: int = Field(default=10, alias="CLAUDE_MAX_EXAMPLES")
+    claude_retry_attempts: int = Field(default=3, alias="CLAUDE_RETRY_ATTEMPTS")
+    claude_retry_max_wait_seconds: int = Field(default=8, alias="CLAUDE_RETRY_MAX_WAIT_SECONDS")
+    claude_alert_dedup_minutes: int = Field(default=240, alias="CLAUDE_ALERT_DEDUP_MINUTES")
+    opportunity_min_confidence: str = Field(default="medium", alias="OPPORTUNITY_MIN_CONFIDENCE")
+    opportunity_min_unique_buyers_5m: int = Field(default=0, alias="OPPORTUNITY_MIN_UNIQUE_BUYERS_5M")
+    opportunity_max_wallet_concentration_5m: float = Field(
+        default=1.0,
+        alias="OPPORTUNITY_MAX_WALLET_CONCENTRATION_5M",
+    )
+    dexscreener_enabled: bool = Field(default=True, alias="DEXSCREENER_ENABLED")
+    dexscreener_base_url: str = Field(
+        default="https://api.dexscreener.com/latest/dex/tokens",
+        alias="DEXSCREENER_BASE_URL",
+    )
+    dexscreener_timeout_seconds: int = Field(default=8, alias="DEXSCREENER_TIMEOUT_SECONDS")
 
     # Telegram notifications
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
+    discord_webhook_url: str = Field(default="", alias="DISCORD_WEBHOOK_URL")
 
     @property
     def claude_enabled(self) -> bool:
@@ -72,6 +90,10 @@ class Settings(BaseSettings):
     @property
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_bot_token.strip() and self.telegram_chat_id.strip())
+
+    @property
+    def discord_enabled(self) -> bool:
+        return bool(self.discord_webhook_url.strip())
 
     @property
     def tracked_programs(self) -> dict[str, set[str]]:
@@ -86,6 +108,15 @@ class Settings(BaseSettings):
         return {name: ids for name, ids in by_name.items() if ids}
 
     @property
+    def invalid_tracked_program_ids(self) -> list[str]:
+        bad: list[str] = []
+        for ids in self.tracked_programs.values():
+            for program_id in ids:
+                if not self._looks_like_program_id(program_id):
+                    bad.append(program_id)
+        return sorted(set(bad))
+
+    @property
     def tracked_program_lookup(self) -> dict[str, str]:
         lookup: dict[str, str] = {}
         for program_name, ids in self.tracked_programs.items():
@@ -98,9 +129,11 @@ class Settings(BaseSettings):
         try:
             payload = json.loads(self.idl_program_id_map_json)
         except json.JSONDecodeError:
+            LOGGER.warning("invalid_idl_program_id_map_json")
             return {}
 
         if not isinstance(payload, dict):
+            LOGGER.warning("invalid_idl_program_id_map_type expected=dict")
             return {}
         output: dict[str, str] = {}
         for key, value in payload.items():
@@ -121,3 +154,10 @@ class Settings(BaseSettings):
     @staticmethod
     def _split_csv(value: str) -> set[str]:
         return {item.strip() for item in value.split(",") if item.strip()}
+
+    @staticmethod
+    def _looks_like_program_id(value: str) -> bool:
+        clean = value.strip()
+        if len(clean) < 32 or len(clean) > 44:
+            return False
+        return all(ch in _B58_CHARS for ch in clean)

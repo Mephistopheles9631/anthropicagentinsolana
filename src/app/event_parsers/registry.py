@@ -33,14 +33,35 @@ class EventParserRegistry:
         signer: str | None,
         ingested_at: datetime,
     ) -> ParsedSwap | ParsedCreate | None:
+        result, _errors = self.parse_with_diagnostics(
+            program_id,
+            log_data,
+            slot,
+            signature,
+            signer,
+            ingested_at,
+        )
+        return result
+
+    def parse_with_diagnostics(
+        self,
+        program_id: str,
+        log_data: bytes,
+        slot: int | None,
+        signature: str | None,
+        signer: str | None,
+        ingested_at: datetime,
+    ) -> tuple[ParsedSwap | ParsedCreate | None, list[str]]:
+        errors: list[str] = []
         for parser in self._parsers.get(program_id, []):
             try:
                 result = parser.try_parse(log_data, slot, signature, signer, ingested_at)  # type: ignore[attr-defined]
                 if result is not None:
-                    return result
-            except Exception:
+                    return result, errors
+            except Exception as exc:
+                errors.append(type(exc).__name__)
                 LOGGER.debug("parser error program_id=%s", program_id, exc_info=True)
-        return None
+        return None, errors
 
     def has_program(self, program_id: str) -> bool:
         return program_id in self._parsers

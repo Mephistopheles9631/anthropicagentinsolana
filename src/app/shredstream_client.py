@@ -9,7 +9,13 @@ from collections.abc import AsyncIterator
 import grpc
 import orjson
 from google.protobuf.json_format import MessageToDict, ParseDict
-from tenacity import retry, retry_if_exception_type, stop_never, wait_exponential_jitter
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_never,
+    wait_exponential_jitter,
+)
 
 from .config import Settings
 
@@ -48,6 +54,7 @@ class ShredstreamClient:
         retry=retry_if_exception_type(StreamDisconnectedError),
         wait=wait_exponential_jitter(initial=1, max=20),
         stop=stop_never,
+        before_sleep=before_sleep_log(LOGGER, logging.WARNING),
         reraise=True,
     )
     async def stream(self) -> AsyncIterator[dict]:
